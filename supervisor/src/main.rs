@@ -381,12 +381,15 @@ async fn main() {
 
             // Ctrl command (async, request-response)
             result = ctrl_listener.accept() => {
-                if let Ok((mut stream, _)) = result {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = vec![0u8; 8192];
-                    if let Ok(n) = stream.read(&mut buf).await {
-                        let input = String::from_utf8_lossy(&buf[..n]);
-                        let cmd = input.trim();
+                if let Ok((stream, _)) = result {
+                    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    // Read one line (up to \n) — don't wait for EOF
+                    if let Ok(n) = reader.read_line(&mut line).await {
+                        if n == 0 { continue; }
+                        let cmd = line.trim();
+                        let mut stream = reader.into_inner();
 
                         if cmd.starts_with("RELOAD") {
                             match wl.reload(&conf_path) {
