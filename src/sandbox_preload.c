@@ -110,95 +110,28 @@ static int apply_landlock(void) {
         return 0;
     }
 
-    // Build handled_access_fs bitmask (ABI-version-aware)
+    // Landlock strategy: only handle READ operations.
+    //
+    // Write enforcement is the seccomp supervisor's job. If Landlock handled
+    // writes too, it would block them AFTER the supervisor returns CONTINUE
+    // for whitelisted paths (seccomp fires first, but CONTINUE lets the
+    // kernel proceed into Landlock). COW avoids this by using inject_fd
+    // (synthetic return, kernel never executes the real syscall), but
+    // whitelisted CONTINUE paths would still hit Landlock.
+    //
+    // By only handling reads, Landlock acts as defense-in-depth for read
+    // access, while all write control flows through the supervisor.
     __u64 handled = LANDLOCK_ACCESS_FS_EXECUTE
-        | LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_READ_FILE
-        | LANDLOCK_ACCESS_FS_READ_DIR   | LANDLOCK_ACCESS_FS_REMOVE_DIR
-        | LANDLOCK_ACCESS_FS_REMOVE_FILE| LANDLOCK_ACCESS_FS_MAKE_CHAR
-        | LANDLOCK_ACCESS_FS_MAKE_DIR   | LANDLOCK_ACCESS_FS_MAKE_REG
-        | LANDLOCK_ACCESS_FS_MAKE_SOCK  | LANDLOCK_ACCESS_FS_MAKE_FIFO
-        | LANDLOCK_ACCESS_FS_MAKE_BLOCK | LANDLOCK_ACCESS_FS_MAKE_SYM;
-    if (abi >= 2) handled |= LANDLOCK_ACCESS_FS_REFER;
-    if (abi >= 3) handled |= LANDLOCK_ACCESS_FS_TRUNCATE;
-
-    __u64 read_access  = LANDLOCK_ACCESS_FS_EXECUTE
-        | LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
+        | LANDLOCK_ACCESS_FS_READ_FILE
+        | LANDLOCK_ACCESS_FS_READ_DIR;
 
     struct landlock_ruleset_attr attr = { .handled_access_fs = handled };
     int ruleset_fd = syscall(__NR_landlock_create_ruleset, &attr, sizeof(attr), 0);
     if (ruleset_fd < 0) return -1;
 
-    // Standard read paths (always allowed)
-    const char *read_paths[] = {
-        "/usr", "/lib", "/lib64", "/bin", "/sbin",
-        "/etc", "/proc", "/dev", "/sys", "/run",
-        NULL
-    };
-    for (int i = 0; read_paths[i]; i++)
-        add_path_rule(ruleset_fd, read_paths[i], read_access);
-
-    // Parse config file: [write] paths get full access
-    FILE *f = fopen(conf_path, "r");
-    if (f) {
-        int section = 0;
-        char line[512];
-        while (fgets(line, sizeof(line), f)) {
-            line[strcspn(line, "\n")] = '\0';
-            if (line[0] == '#' || line[0] == '\0') continue;
-            if (strcmp(line, "[write]") == 0) { section = 1; continue; }
-            if (strcmp(line, "[read]") == 0)  { section = 2; continue; }
-
-            if (section == 1) {
-                // Write paths get full access (read + write + create + delete)
-                add_path_rule(ruleset_fd, line, handled);
-            }
-            // Read-deny paths are NOT added to Landlock (handled by supervisor)
-        }
-        fclose(f);
-    }
-
-    // Also allow access to the base directory (for sockets, logs, COW)
-    char basedir[PATH_MAX];
-    strncpy(basedir, sock_path, PATH_MAX - 1);
-    basedir[PATH_MAX - 1] = '\0';
-    char *last_slash = strrchr(basedir, '/');
-    if (last_slash) {
-        *last_slash = '\0';
-        add_path_rule(ruleset_fd, basedir, handled);
-    }
-
-    // Allow /tmp for general temp file usage
-    add_path_rule(ruleset_fd, "/tmp", handled);
-
-    // Allow /dev read+write (for /dev/null, /dev/tty, /dev/urandom, etc.)
-    add_path_rule(ruleset_fd, "/dev", handled);
-
-    // Allow read access to the preload .so itself (for child process LD_PRELOAD)
-    const char *preload_path = getenv("LD_PRELOAD");
-    if (preload_path) {
-        // LD_PRELOAD may contain multiple entries separated by colons/spaces
-        char preload_copy[PATH_MAX];
-        strncpy(preload_copy, preload_path, PATH_MAX - 1);
-        preload_copy[PATH_MAX - 1] = '\0';
-        char *tok = strtok(preload_copy, ": ");
-        while (tok) {
-            // Add the directory containing the .so for read access
-            char dir[PATH_MAX];
-            strncpy(dir, tok, PATH_MAX - 1);
-            dir[PATH_MAX - 1] = '\0';
-            char *ds = strrchr(dir, '/');
-            if (ds) {
-                *ds = '\0';
-                add_path_rule(ruleset_fd, dir, read_access);
-            }
-            tok = strtok(NULL, ": ");
-        }
-    }
-
-    // Allow read access to the current working directory
-    char cwd[PATH_MAX];
-    if (getcwd(cwd, sizeof(cwd)))
-        add_path_rule(ruleset_fd, cwd, read_access);
+    // Allow read+execute on root "/" — all reads pass through
+    // [read] deny enforcement is handled by the supervisor
+    add_path_rule(ruleset_fd, "/", handled);
 
     // Enforce (irreversible)
     // PR_SET_NO_NEW_PRIVS is set later in install_filter(), but Landlock also
