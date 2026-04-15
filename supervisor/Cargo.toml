@@ -1,0 +1,14 @@
+[package]
+name = "supervisor"
+version = "0.3.0"
+edition = "2021"
+description = "Fastcode seccomp supervisor — sandboxed file access control"
+
+[dependencies]
+libc = "0.2"
+nix = { version = "0.29", features = ["process", "signal", "fs"] }
+tokio = { version = "1", features = ["rt", "net", "sync", "macros", "signal", "io-util"] }
+
+[profile.release]
+opt-level = 2
+lto = "thin"
