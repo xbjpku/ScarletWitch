@@ -379,20 +379,67 @@ async fn main() {
                 }
             }
 
-            // Ctrl command (async)
+            // Ctrl command (async, request-response)
             result = ctrl_listener.accept() => {
                 if let Ok((mut stream, _)) = result {
-                    let mut buf = [0u8; 16];
-                    use tokio::io::AsyncReadExt;
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 8192];
                     if let Ok(n) = stream.read(&mut buf).await {
-                        let cmd = std::str::from_utf8(&buf[..n]).unwrap_or("");
+                        let input = String::from_utf8_lossy(&buf[..n]);
+                        let cmd = input.trim();
+
                         if cmd.starts_with("RELOAD") {
                             match wl.reload(&conf_path) {
-                                Ok(()) => eprintln!(
-                                    "[supervisor] reloaded: write-allow={}, read-deny={}",
-                                    wl.write_count(), wl.read_count()
-                                ),
-                                Err(e) => eprintln!("[supervisor] reload failed: {}", e),
+                                Ok(()) => {
+                                    eprintln!("[supervisor] reloaded: write-allow={}, read-deny={}",
+                                        wl.write_count(), wl.read_count());
+                                    let _ = stream.write_all(b"{\"ok\":true}\n").await;
+                                }
+                                Err(e) => {
+                                    eprintln!("[supervisor] reload failed: {}", e);
+                                    let _ = stream.write_all(
+                                        format!("{{\"ok\":false,\"error\":\"{}\"}}\n", e).as_bytes()
+                                    ).await;
+                                }
+                            }
+                        } else if cmd == "LIST_COW" {
+                            let json = cow_table.to_json();
+                            eprintln!("[supervisor] LIST_COW: {} entries", cow_table.entries().len());
+                            let _ = stream.write_all(json.as_bytes()).await;
+                            let _ = stream.write_all(b"\n").await;
+                        } else if cmd.starts_with("COMMIT") {
+                            // COMMIT\n["path1","path2"]
+                            // or COMMIT ["path1","path2"] (single line)
+                            let json_part = if let Some(rest) = cmd.strip_prefix("COMMIT") {
+                                rest.trim()
+                            } else { "" };
+
+                            // Parse JSON array of paths
+                            let paths = parse_json_string_array(json_part);
+                            match cow_table.commit_paths(&paths) {
+                                Ok(committed) => {
+                                    eprintln!("[supervisor] COMMIT: {} paths committed", committed.len());
+                                    let _ = stream.write_all(
+                                        format!("{{\"ok\":true,\"committed\":{}}}\n", committed.len()).as_bytes()
+                                    ).await;
+                                }
+                                Err(e) => {
+                                    eprintln!("[supervisor] COMMIT failed: {}", e);
+                                    let _ = stream.write_all(
+                                        format!("{{\"ok\":false,\"error\":\"{}\"}}\n", e).as_bytes()
+                                    ).await;
+                                }
+                            }
+                        } else if cmd == "DISCARD" {
+                            match cow_table.discard_all() {
+                                Ok(()) => {
+                                    let _ = stream.write_all(b"{\"ok\":true}\n").await;
+                                }
+                                Err(e) => {
+                                    let _ = stream.write_all(
+                                        format!("{{\"ok\":false,\"error\":\"{}\"}}\n", e).as_bytes()
+                                    ).await;
+                                }
                             }
                         }
                     }
@@ -416,4 +463,39 @@ async fn main() {
     unsafe { libc::close(notify_srv_fd) };
     let _ = std::fs::remove_file(&ctrl_path);
     let _ = std::fs::remove_file(&notify_path);
+}
+
+/// Simple JSON string array parser: ["a","b","c"] → vec!["a","b","c"]
+/// Handles escaped quotes. No external JSON dependency.
+fn parse_json_string_array(input: &str) -> Vec<String> {
+    let input = input.trim();
+    if !input.starts_with('[') || !input.ends_with(']') {
+        return Vec::new();
+    }
+    let inner = &input[1..input.len() - 1];
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for ch in inner.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => escaped = true,
+            '"' => {
+                if in_string {
+                    result.push(current.clone());
+                    current.clear();
+                }
+                in_string = !in_string;
+            }
+            _ if in_string => current.push(ch),
+            _ => {} // skip commas, spaces outside strings
+        }
+    }
+    result
 }

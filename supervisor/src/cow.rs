@@ -6,34 +6,62 @@
 // For other write syscalls (mkdir, rename, chmod, symlink, truncate):
 // the supervisor performs the operation in the COW layer on behalf of the child
 // and returns a synthetic success (0).
+//
+// Each entry tracks metadata: operation type, triggering command, timestamp.
 
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::notif;
 
 const COW_MAX_ENTRIES: usize = 4096;
 
+// ================================================================
+// Data structures
+// ================================================================
+
 #[derive(Clone)]
-struct CowEntry {
-    orig_path: String,
-    cow_path: PathBuf,
+pub struct CowEntry {
+    pub orig_path: String,
+    pub cow_path: PathBuf,
+    pub operation: String,  // "openat", "mkdir(legacy)", "fchmodat", etc.
+    pub command: String,    // from /proc/{pid}/cmdline
+    pub timestamp: u64,     // unix epoch seconds
 }
 
 pub struct CowTable {
     entries: Vec<CowEntry>,
-    /// Paths that have been "deleted" in the COW layer (whiteout).
     deleted: HashSet<String>,
     cow_dir: PathBuf,
     manifest_path: PathBuf,
     deleted_path: PathBuf,
 }
 
+/// Read /proc/{pid}/cmdline, replace NUL bytes with spaces.
+pub fn read_command_context(pid: u32) -> String {
+    fs::read(format!("/proc/{}/cmdline", pid))
+        .map(|b| {
+            b.split(|&c| c == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default()
+}
+
+fn now_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 impl CowTable {
-    /// Initialize: create directories, load existing manifest and deletions.
     pub fn init(session_dir: &Path) -> io::Result<Self> {
         let cow_dir = session_dir.join("cow_files");
         let manifest_path = session_dir.join("cow_tree");
@@ -50,13 +78,11 @@ impl CowTable {
             deleted_path,
         };
 
-        // Load existing manifest (for session restart)
         if table.manifest_path.exists() {
             if let Err(e) = table.load_manifest() {
                 eprintln!("[cow] load manifest: {}", e);
             }
         }
-        // Load existing deletions
         if table.deleted_path.exists() {
             if let Err(e) = table.load_deleted() {
                 eprintln!("[cow] load deleted: {}", e);
@@ -72,12 +98,10 @@ impl CowTable {
         Ok(table)
     }
 
-    /// Check if a path has been "deleted" in the COW layer.
     pub fn is_deleted(&self, orig_path: &str) -> bool {
         self.deleted.contains(orig_path)
     }
 
-    /// Look up whether orig_path has a COW entry.
     pub fn lookup(&self, orig_path: &str) -> Option<&Path> {
         self.entries
             .iter()
@@ -85,7 +109,14 @@ impl CowTable {
             .map(|e| e.cow_path.as_path())
     }
 
-    /// Get the COW path for an original path (whether or not it exists yet).
+    pub fn entries(&self) -> &[CowEntry] {
+        &self.entries
+    }
+
+    pub fn deleted_paths(&self) -> &HashSet<String> {
+        &self.deleted
+    }
+
     fn cow_path_for(&self, orig_path: &str) -> PathBuf {
         self.cow_dir.join(orig_path.trim_start_matches('/'))
     }
@@ -94,14 +125,14 @@ impl CowTable {
     // openat COW — materialize file + inject fd
     // ================================================================
 
-    /// Perform COW: copy original file to cow_dir, add entry, write manifest.
     pub fn materialize(
         &mut self,
         orig_path: &str,
         open_flags: i32,
         mode: u32,
+        operation: &str,
+        command: &str,
     ) -> io::Result<()> {
-        // Already exists?
         if self.lookup(orig_path).is_some() {
             return Ok(());
         }
@@ -114,13 +145,10 @@ impl CowTable {
         }
 
         let cow_path = self.cow_path_for(orig_path);
-
-        // Create parent directories
         if let Some(parent) = cow_path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        // Copy original or create empty
         let orig = Path::new(orig_path);
         if orig.exists() {
             let meta = fs::metadata(orig)?;
@@ -148,35 +176,31 @@ impl CowTable {
             ));
         }
 
-        // Remove from deleted set if it was previously deleted
         self.deleted.remove(orig_path);
-
         self.entries.push(CowEntry {
             orig_path: orig_path.to_string(),
             cow_path,
+            operation: operation.to_string(),
+            command: command.to_string(),
+            timestamp: now_epoch(),
         });
 
         if let Err(e) = self.save_manifest() {
             eprintln!("[cow] save manifest: {}", e);
         }
-
         Ok(())
     }
 
-    /// Materialize a file for modification (no O_CREAT, no open_flags dependency).
-    /// Used by chmod, truncate etc. that need the file to exist in COW first.
-    fn ensure_materialized(&mut self, orig_path: &str) -> io::Result<PathBuf> {
+    fn ensure_materialized(&mut self, orig_path: &str, operation: &str, command: &str) -> io::Result<PathBuf> {
         if let Some(p) = self.lookup(orig_path) {
             return Ok(p.to_path_buf());
         }
-        // Materialize with O_WRONLY (just need to copy)
-        self.materialize(orig_path, libc::O_WRONLY, 0o644)?;
+        self.materialize(orig_path, libc::O_WRONLY, 0o644, operation, command)?;
         self.lookup(orig_path)
             .map(|p| p.to_path_buf())
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "materialize failed"))
     }
 
-    /// Open the COW copy and inject fd into child via SECCOMP_ADDFD.
     pub fn inject_fd(
         &self,
         notify_fd: RawFd,
@@ -190,42 +214,42 @@ impl CowTable {
         if sv_fd < 0 {
             return Err(io::Error::last_os_error());
         }
-
         if let Err(e) = notif::id_valid(notify_fd, req_id) {
             unsafe { libc::close(sv_fd) };
             return Err(e);
         }
-
         let result = notif::inject_fd_send(notify_fd, req_id, sv_fd, open_flags, mode);
         unsafe { libc::close(sv_fd) };
         result
     }
 
     // ================================================================
-    // Write-family COW operations (supervisor performs on behalf)
+    // Write-family COW operations
     // ================================================================
 
-    /// COW mkdir: create directory in COW layer.
-    pub fn cow_mkdir(&mut self, orig_path: &str, mode: u32) -> io::Result<()> {
+    pub fn cow_mkdir(&mut self, orig_path: &str, mode: u32, operation: &str, command: &str) -> io::Result<()> {
         let cow_path = self.cow_path_for(orig_path);
         fs::create_dir_all(&cow_path)?;
-        // Set permissions
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&cow_path, fs::Permissions::from_mode(mode))?;
         self.deleted.remove(orig_path);
-        eprintln!("[cow] mkdir {} -> {}", orig_path, cow_path.display());
-        // Directories don't go in the file manifest (they're structural)
+        // Track mkdir as an entry too (so it shows up in LIST_COW)
+        self.entries.push(CowEntry {
+            orig_path: orig_path.to_string(),
+            cow_path,
+            operation: operation.to_string(),
+            command: command.to_string(),
+            timestamp: now_epoch(),
+        });
+        if let Err(e) = self.save_manifest() { eprintln!("[cow] save manifest: {}", e); }
+        eprintln!("[cow] mkdir {} -> {}", orig_path, self.cow_path_for(orig_path).display());
         Ok(())
     }
 
-    /// COW rename: materialize source if needed, then rename within COW layer.
-    /// Both src and dst are outside the write whitelist.
-    pub fn cow_rename(&mut self, src_path: &str, dst_path: &str) -> io::Result<()> {
-        // Materialize source if not already in COW
+    pub fn cow_rename(&mut self, src_path: &str, dst_path: &str, operation: &str, command: &str) -> io::Result<()> {
         let src_cow = if let Some(p) = self.lookup(src_path) {
             p.to_path_buf()
         } else {
-            // Source exists on real FS, copy it in
             let orig = Path::new(src_path);
             if !orig.exists() {
                 return Err(io::Error::new(
@@ -233,7 +257,7 @@ impl CowTable {
                     format!("rename source {} does not exist", src_path),
                 ));
             }
-            self.materialize(src_path, libc::O_RDONLY, 0o644)?;
+            self.materialize(src_path, libc::O_RDONLY, 0o644, operation, command)?;
             self.lookup(src_path)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "materialize failed"))?
                 .to_path_buf()
@@ -243,49 +267,52 @@ impl CowTable {
         if let Some(parent) = dst_cow.parent() {
             fs::create_dir_all(parent)?;
         }
-
         fs::rename(&src_cow, &dst_cow)?;
 
-        // Update entries: remove src, add dst
         self.entries.retain(|e| e.orig_path != src_path);
         self.entries.push(CowEntry {
             orig_path: dst_path.to_string(),
-            cow_path: dst_cow.clone(),
+            cow_path: dst_cow,
+            operation: operation.to_string(),
+            command: command.to_string(),
+            timestamp: now_epoch(),
         });
         self.deleted.remove(dst_path);
 
-        if let Err(e) = self.save_manifest() {
-            eprintln!("[cow] save manifest: {}", e);
-        }
-
+        if let Err(e) = self.save_manifest() { eprintln!("[cow] save manifest: {}", e); }
         eprintln!("[cow] rename {} -> {}", src_path, dst_path);
         Ok(())
     }
 
-    /// COW symlink: create symlink in COW layer.
-    pub fn cow_symlink(&mut self, target: &str, linkpath: &str) -> io::Result<()> {
+    pub fn cow_symlink(&mut self, target: &str, linkpath: &str, operation: &str, command: &str) -> io::Result<()> {
         let cow_link = self.cow_path_for(linkpath);
         if let Some(parent) = cow_link.parent() {
             fs::create_dir_all(parent)?;
         }
         std::os::unix::fs::symlink(target, &cow_link)?;
         self.deleted.remove(linkpath);
+        self.entries.push(CowEntry {
+            orig_path: linkpath.to_string(),
+            cow_path: cow_link,
+            operation: operation.to_string(),
+            command: command.to_string(),
+            timestamp: now_epoch(),
+        });
+        if let Err(e) = self.save_manifest() { eprintln!("[cow] save manifest: {}", e); }
         eprintln!("[cow] symlink {} -> {}", linkpath, target);
         Ok(())
     }
 
-    /// COW chmod: materialize file, then change permissions on the COW copy.
-    pub fn cow_chmod(&mut self, orig_path: &str, mode: u32) -> io::Result<()> {
-        let cow_path = self.ensure_materialized(orig_path)?;
+    pub fn cow_chmod(&mut self, orig_path: &str, mode: u32, operation: &str, command: &str) -> io::Result<()> {
+        let cow_path = self.ensure_materialized(orig_path, operation, command)?;
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&cow_path, fs::Permissions::from_mode(mode))?;
         eprintln!("[cow] chmod {} mode={:o}", orig_path, mode);
         Ok(())
     }
 
-    /// COW truncate: materialize file, then truncate the COW copy.
-    pub fn cow_truncate(&mut self, orig_path: &str, length: i64) -> io::Result<()> {
-        let cow_path = self.ensure_materialized(orig_path)?;
+    pub fn cow_truncate(&mut self, orig_path: &str, length: i64, operation: &str, command: &str) -> io::Result<()> {
+        let cow_path = self.ensure_materialized(orig_path, operation, command)?;
         let file = fs::OpenOptions::new().write(true).open(&cow_path)?;
         file.set_len(length as u64)?;
         eprintln!("[cow] truncate {} len={}", orig_path, length);
@@ -293,7 +320,93 @@ impl CowTable {
     }
 
     // ================================================================
-    // Manifest I/O — tree-indent format
+    // Commit / Discard
+    // ================================================================
+
+    /// Commit selected COW entries: copy cow→orig, remove from table.
+    pub fn commit_paths(&mut self, paths: &[String]) -> io::Result<Vec<String>> {
+        let mut committed = Vec::new();
+        for path in paths {
+            if let Some(cow_path) = self.lookup(path) {
+                let cow_path = cow_path.to_path_buf();
+                // Create parent dir if needed
+                if let Some(parent) = Path::new(path.as_str()).parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                if cow_path.is_dir() {
+                    // For mkdir COW entries, create the real dir
+                    fs::create_dir_all(path)?;
+                } else {
+                    fs::copy(&cow_path, path)?;
+                }
+                committed.push(path.clone());
+                eprintln!("[cow] committed {} <- {}", path, cow_path.display());
+            }
+        }
+        self.entries.retain(|e| !committed.contains(&e.orig_path));
+        if let Err(e) = self.save_manifest() {
+            eprintln!("[cow] save manifest: {}", e);
+        }
+        Ok(committed)
+    }
+
+    /// Discard all COW state.
+    pub fn discard_all(&mut self) -> io::Result<()> {
+        self.entries.clear();
+        self.deleted.clear();
+        if self.cow_dir.exists() {
+            for entry in fs::read_dir(&self.cow_dir)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    let _ = fs::remove_dir_all(entry.path());
+                } else {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+        if let Err(e) = self.save_manifest() {
+            eprintln!("[cow] save manifest: {}", e);
+        }
+        eprintln!("[cow] discarded all entries");
+        Ok(())
+    }
+
+    // ================================================================
+    // JSON serialization (for LIST_COW)
+    // ================================================================
+
+    pub fn to_json(&self) -> String {
+        let entries_json: Vec<String> = self
+            .entries
+            .iter()
+            .map(|e| {
+                format!(
+                    r#"{{"orig_path":"{}","cow_path":"{}","operation":"{}","command":"{}","timestamp":{}}}"#,
+                    json_escape(&e.orig_path),
+                    json_escape(&e.cow_path.to_string_lossy()),
+                    json_escape(&e.operation),
+                    json_escape(&e.command),
+                    e.timestamp
+                )
+            })
+            .collect();
+
+        let deleted_json: Vec<String> = self
+            .deleted
+            .iter()
+            .map(|p| format!(r#""{}""#, json_escape(p)))
+            .collect();
+
+        format!(
+            r#"{{"entries":[{}],"deleted":[{}],"count":{}}}"#,
+            entries_json.join(","),
+            deleted_json.join(","),
+            self.entries.len()
+        )
+    }
+
+    // ================================================================
+    // Manifest I/O
     // ================================================================
 
     fn save_manifest(&self) -> io::Result<()> {
@@ -334,7 +447,16 @@ impl CowTable {
 
             let depth = parts.len();
             let indent = depth * 2;
-            writeln!(f, "{:indent$}{}", "", parts[parts.len() - 1], indent = indent)?;
+            // Append metadata as comment: # op=openat cmd=echo... ts=1713168000
+            writeln!(
+                f,
+                "{:indent$}{}  # op={} ts={}",
+                "",
+                parts[parts.len() - 1],
+                entry.operation,
+                entry.timestamp,
+                indent = indent
+            )?;
 
             prev_parts = parts.iter().map(|s| s.to_string()).collect();
         }
@@ -345,7 +467,6 @@ impl CowTable {
     fn load_manifest(&mut self) -> io::Result<()> {
         let file = fs::File::open(&self.manifest_path)?;
         let reader = BufReader::new(file);
-
         let mut dir_stack: Vec<String> = Vec::new();
 
         for line in reader.lines() {
@@ -360,7 +481,14 @@ impl CowTable {
 
             let indent = line.len() - line.trim_start().len();
             let level = indent / 2;
-            let trimmed = line.trim();
+
+            // Strip inline comment: "filename  # op=openat ts=123"
+            let trimmed_full = line.trim();
+            let (trimmed, meta_comment) = if let Some(idx) = trimmed_full.find("  # ") {
+                (&trimmed_full[..idx], Some(&trimmed_full[idx + 4..]))
+            } else {
+                (trimmed_full, None)
+            };
 
             if trimmed.is_empty() {
                 continue;
@@ -385,9 +513,15 @@ impl CowTable {
 
                 let cow_path = self.cow_dir.join(orig.trim_start_matches('/'));
 
+                // Parse metadata from comment
+                let (operation, timestamp) = parse_meta_comment(meta_comment);
+
                 self.entries.push(CowEntry {
                     orig_path: orig,
                     cow_path,
+                    operation,
+                    command: String::new(), // not persisted in manifest
+                    timestamp,
                 });
             }
         }
@@ -431,9 +565,7 @@ fn copy_file(src: &Path, dst: &Path) -> io::Result<()> {
     let mut buf = [0u8; 65536];
     loop {
         let n = input.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
+        if n == 0 { break; }
         output.write_all(&buf[..n])?;
     }
     Ok(())
@@ -445,7 +577,29 @@ fn path_to_cstr(path: &Path) -> io::Result<std::ffi::CString> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))
 }
 
-// Extension trait to set file mode on OpenOptions
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+fn parse_meta_comment(comment: Option<&str>) -> (String, u64) {
+    let mut operation = String::new();
+    let mut timestamp = 0u64;
+    if let Some(c) = comment {
+        for part in c.split_whitespace() {
+            if let Some(val) = part.strip_prefix("op=") {
+                operation = val.to_string();
+            } else if let Some(val) = part.strip_prefix("ts=") {
+                timestamp = val.parse().unwrap_or(0);
+            }
+        }
+    }
+    (operation, timestamp)
+}
+
 trait OpenOptionsModeExt {
     fn mode_ext(&mut self, mode: u32) -> &mut Self;
 }
