@@ -323,50 +323,73 @@ impl CowTable {
     // Commit / Discard
     // ================================================================
 
-    /// Commit selected COW entries: copy cow→orig, remove from table.
+    /// Commit selected COW entries: copy cow→orig, remove cow files, remove from table.
     pub fn commit_paths(&mut self, paths: &[String]) -> io::Result<Vec<String>> {
         let mut committed = Vec::new();
         for path in paths {
             if let Some(cow_path) = self.lookup(path) {
                 let cow_path = cow_path.to_path_buf();
-                // Create parent dir if needed
+                // Create parent dir on real FS if needed
                 if let Some(parent) = Path::new(path.as_str()).parent() {
                     let _ = fs::create_dir_all(parent);
                 }
                 if cow_path.is_dir() {
-                    // For mkdir COW entries, create the real dir
                     fs::create_dir_all(path)?;
+                    // Copy contents of COW dir to real dir
+                    if let Ok(entries) = fs::read_dir(&cow_path) {
+                        for entry in entries.flatten() {
+                            let dest = Path::new(path.as_str()).join(entry.file_name());
+                            if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                                let _ = fs::copy(entry.path(), &dest);
+                            }
+                        }
+                    }
                 } else {
                     fs::copy(&cow_path, path)?;
+                }
+                // Clean up the COW file/dir
+                if cow_path.is_dir() {
+                    let _ = fs::remove_dir_all(&cow_path);
+                } else {
+                    let _ = fs::remove_file(&cow_path);
                 }
                 committed.push(path.clone());
                 eprintln!("[cow] committed {} <- {}", path, cow_path.display());
             }
         }
+        // Remove committed entries from table
         self.entries.retain(|e| !committed.contains(&e.orig_path));
         if let Err(e) = self.save_manifest() {
             eprintln!("[cow] save manifest: {}", e);
         }
+        // If all entries committed, do a full reset
+        if self.entries.is_empty() {
+            self.reset_cow_dir();
+        }
         Ok(committed)
     }
 
-    /// Discard all COW state.
-    pub fn discard_all(&mut self) -> io::Result<()> {
-        self.entries.clear();
-        self.deleted.clear();
+    /// Reset COW state: clear entries, delete cow_files contents, rewrite manifest.
+    /// Called after all entries are committed or after DISCARD.
+    fn reset_cow_dir(&mut self) {
         if self.cow_dir.exists() {
-            for entry in fs::read_dir(&self.cow_dir)? {
-                let entry = entry?;
-                if entry.file_type()?.is_dir() {
+            for entry in fs::read_dir(&self.cow_dir).into_iter().flatten().flatten() {
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     let _ = fs::remove_dir_all(entry.path());
                 } else {
                     let _ = fs::remove_file(entry.path());
                 }
             }
         }
-        if let Err(e) = self.save_manifest() {
-            eprintln!("[cow] save manifest: {}", e);
-        }
+        self.entries.clear();
+        self.deleted.clear();
+        let _ = self.save_manifest();
+        eprintln!("[cow] reset: cow_dir cleaned, manifest cleared");
+    }
+
+    /// Discard all COW state.
+    pub fn discard_all(&mut self) -> io::Result<()> {
+        self.reset_cow_dir();
         eprintln!("[cow] discarded all entries");
         Ok(())
     }
