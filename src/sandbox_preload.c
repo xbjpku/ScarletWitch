@@ -212,7 +212,10 @@ static int apply_landlock(void) {
         return -1;
     }
 
-    fprintf(stderr, "[sandbox] Landlock applied (ABI v%d)\n", abi);
+    // Landlock log goes to child stderr, not supervisor log — keep quiet
+    // unless SANDBOX_DEBUG is set.
+    if (getenv("SANDBOX_DEBUG"))
+        fprintf(stderr, "[sandbox] Landlock applied (ABI v%d)\n", abi);
     return 0;
 }
 
@@ -489,7 +492,8 @@ static void sandbox_init(void) {
 
     // 1. Apply Landlock (defense-in-depth, doesn't need supervisor)
     if (apply_landlock() < 0)
-        fprintf(stderr, "[sandbox] WARNING: Landlock not applied\n");
+        if (getenv("SANDBOX_DEBUG"))
+            fprintf(stderr, "[sandbox] WARNING: Landlock not applied\n");
 
     // 2. Install expanded seccomp filter
     int notify_fd = install_filter();

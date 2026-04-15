@@ -18,8 +18,6 @@ use std::ffi::CString;
 use std::io::{self, Read};
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::Arc;
 
 use tokio::net::UnixListener;
 use tokio::sync::mpsc;
@@ -179,9 +177,9 @@ enum Event {
     /// A new notify fd was received from a child via SCM_RIGHTS.
     NewNotifyFd(RawFd),
     /// A seccomp notification was received from the kernel.
-    Notification(SeccompNotif),
-    /// The notify fd was closed (child exited).
-    NotifyFdClosed,
+    Notification(SeccompNotif, RawFd),
+    /// A notify fd was closed (child exited).
+    NotifyFdClosed(RawFd),
 }
 
 /// Spawn a thread that accepts connections on the notify socket and
@@ -198,33 +196,24 @@ fn spawn_notify_accept_thread(
                         break;
                     }
                 }
-                Err(_) => {
-                    // Server socket closed or error
-                    break;
-                }
+                Err(_) => break,
             }
         }
     });
 }
 
-/// Spawn a thread that calls SECCOMP_IOCTL_NOTIF_RECV in a loop.
-/// Uses an AtomicI32 to track the current notify_fd (can be swapped).
-fn spawn_notif_recv_thread(
-    notify_fd: Arc<AtomicI32>,
+/// Spawn a dedicated blocking thread for recv_notif on a single fd.
+/// The thread exits when the fd is closed (child exits). Each child
+/// connection gets its own thread — no shared atomic, no races.
+fn spawn_recv_thread_for_fd(
+    fd: RawFd,
     tx: mpsc::UnboundedSender<Event>,
 ) {
     std::thread::spawn(move || {
         loop {
-            let fd = notify_fd.load(Ordering::Acquire);
-            if fd < 0 {
-                // No notify fd yet — sleep briefly and retry
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                continue;
-            }
-
             match notif::recv_notif(fd) {
                 Ok(n) => {
-                    if tx.send(Event::Notification(n)).is_err() {
+                    if tx.send(Event::Notification(n, fd)).is_err() {
                         break;
                     }
                 }
@@ -232,10 +221,9 @@ fn spawn_notif_recv_thread(
                     if e.raw_os_error() == Some(libc::EINTR) {
                         continue;
                     }
-                    // fd closed or error
-                    let _ = tx.send(Event::NotifyFdClosed);
-                    // Reset to -1 so we wait for a new fd
-                    notify_fd.store(-1, Ordering::Release);
+                    // fd closed or error — this thread is done
+                    let _ = tx.send(Event::NotifyFdClosed(fd));
+                    break;
                 }
             }
         }
@@ -348,15 +336,14 @@ async fn main() {
         notify_path.display()
     );
 
-    // Shared notify_fd (AtomicI32 so recv thread can be swapped)
-    let notify_fd = Arc::new(AtomicI32::new(-1));
+    // Current active notify fd (only for dispatching responses)
+    let mut notify_fd: RawFd = -1;
 
     // Event channel from blocking threads
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Event>();
 
-    // Spawn blocking threads
+    // Spawn accept thread (one per session, long-lived)
     spawn_notify_accept_thread(notify_srv_fd, event_tx.clone());
-    spawn_notif_recv_thread(Arc::clone(&notify_fd), event_tx);
 
     // Signal handlers
     let mut sigterm =
@@ -370,24 +357,24 @@ async fn main() {
 
     loop {
         tokio::select! {
-            // Events from blocking threads (notify accept + seccomp recv)
+            // Events from blocking threads
             Some(event) = event_rx.recv() => {
                 match event {
                     Event::NewNotifyFd(fd) => {
-                        let old = notify_fd.swap(fd, Ordering::AcqRel);
-                        if old >= 0 {
-                            unsafe { libc::close(old) };
-                        }
+                        notify_fd = fd;
                         eprintln!("[supervisor] received notify fd={}", fd);
+                        // Spawn a dedicated recv thread for this fd
+                        spawn_recv_thread_for_fd(fd, event_tx.clone());
                     }
-                    Event::Notification(req) => {
-                        let fd = notify_fd.load(Ordering::Acquire);
-                        if fd >= 0 {
-                            dispatch::handle_notification(fd, &req, &mut cow_table, &wl);
+                    Event::Notification(req, fd) => {
+                        dispatch::handle_notification(fd, &req, &mut cow_table, &wl);
+                    }
+                    Event::NotifyFdClosed(fd) => {
+                        eprintln!("[supervisor] notify fd={} closed", fd);
+                        unsafe { libc::close(fd) };
+                        if notify_fd == fd {
+                            notify_fd = -1;
                         }
-                    }
-                    Event::NotifyFdClosed => {
-                        eprintln!("[supervisor] notify fd closed");
                     }
                 }
             }
@@ -423,9 +410,8 @@ async fn main() {
         "[supervisor] shutting down session {}",
         config.session
     );
-    let fd = notify_fd.load(Ordering::Acquire);
-    if fd >= 0 {
-        unsafe { libc::close(fd) };
+    if notify_fd >= 0 {
+        unsafe { libc::close(notify_fd) };
     }
     unsafe { libc::close(notify_srv_fd) };
     let _ = std::fs::remove_file(&ctrl_path);
