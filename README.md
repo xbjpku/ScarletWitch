@@ -1,14 +1,14 @@
 # ScarletWitch
 
-> *"I don't need you to tell me who I am."* — Wanda Maximoff
+> *"I have what I want, and no one will ever take it from me again."* — Wanda Maximoff
 
 **ScarletWitch** is a Linux seccomp-based filesystem sandbox for AI coding agents. Like the Scarlet Witch's Hex, it warps reality for the processes inside — all bash commands execute without asking for permission, but nothing touches the real world. All mutations are trapped in a **copy-on-write illusion** until you decide what becomes canon. And unlike other sandboxes that force you to re-run the entire agent after review, ScarletWitch lets you **turn illusion into reality with a single commit** — no replays, no do-overs. You are the strongest Scarlet Witch.
 
-- **Hex Shield.** Your agent runs at full speed with zero interruptions — every action succeeds, but the real filesystem stays untouched.
-- **Post-review Reality.** After a turn completes, review all changes, approve only what you want — approved changes become real *instantly*, no re-execution needed.
+- **Hex Shield.** Your agent runs automatically with zero interruptions — every action succeeds, but the real filesystem stays untouched and safe.
+- **Post-review Reality.** Review changes, approve only what you want — approved changes become real *instantly*, no re-execution needed.
 - **Chaos Simplification.** The DAG simplifier collapses redundant operations and surfaces only the changes that actually matter — less noise, faster approval.
 
-Designed to work with [opencode](https://github.com/xbjpku/opencode) (branch `sandbox-integration`), but the supervisor is a standalone binary — anything that runs under `LD_PRELOAD` can be hexed.
+Designed to work with [opencode](https://github.com/xbjpku/opencode) (branch `sandbox-integration`), but ScarletWitch is a standalone binary — anything that runs under ScarletWitch can be hexed.
 
 ## How it works
 
