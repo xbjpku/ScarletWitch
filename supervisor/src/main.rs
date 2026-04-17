@@ -405,11 +405,43 @@ async fn main() {
                                     ).await;
                                 }
                             }
-                        } else if cmd == "LIST_COW" {
-                            let json = cow_table.to_json();
-                            eprintln!("[supervisor] LIST_COW: {} entries", cow_table.entries().len());
+                        } else if cmd == "BEGIN_COMMAND" {
+                            cow_table.begin_command();
+                            let _ = stream.write_all(b"{\"ok\":true}\n").await;
+                        } else if cmd.starts_with("LIST_COW") {
+                            // LIST_COW [strict|medium|loose]  (default: medium)
+                            let level = cmd.strip_prefix("LIST_COW").unwrap_or("").trim();
+                            let level = if level.is_empty() { "medium" } else { level };
+                            let json = cow_table.to_json(level);
+                            eprintln!("[supervisor] LIST_COW({}): {} raw, json has entries", level, cow_table.entries().len());
                             let _ = stream.write_all(json.as_bytes()).await;
                             let _ = stream.write_all(b"\n").await;
+                        } else if cmd.starts_with("COMMIT_GEN") {
+                            // COMMIT_GEN <generation_number>
+                            let gen_str = cmd.strip_prefix("COMMIT_GEN").unwrap_or("").trim();
+                            match gen_str.parse::<u64>() {
+                                Ok(gen) => {
+                                    match cow_table.commit_up_to_gen(gen) {
+                                        Ok(committed) => {
+                                            eprintln!("[supervisor] COMMIT_GEN {}: {} paths committed", gen, committed.len());
+                                            let _ = stream.write_all(
+                                                format!("{{\"ok\":true,\"committed\":{}}}\n", committed.len()).as_bytes()
+                                            ).await;
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[supervisor] COMMIT_GEN failed: {}", e);
+                                            let _ = stream.write_all(
+                                                format!("{{\"ok\":false,\"error\":\"{}\"}}\n", e).as_bytes()
+                                            ).await;
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    let _ = stream.write_all(
+                                        b"{\"ok\":false,\"error\":\"invalid generation number\"}\n"
+                                    ).await;
+                                }
+                            }
                         } else if cmd.starts_with("COMMIT") {
                             // COMMIT\n["path1","path2"]
                             // or COMMIT ["path1","path2"] (single line)

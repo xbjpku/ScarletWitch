@@ -52,16 +52,16 @@ pub fn handle_notification(
             || n == libc::SYS_unlink as i64
             || n == libc::SYS_rmdir as i64 =>
         {
-            handle_deny_write(notify_fd, req, whitelist, syscall_name(nr));
+            handle_deny_write(notify_fd, req, cow, whitelist, syscall_name(nr));
         }
         n if n == libc::SYS_linkat || n == libc::SYS_link as i64 => {
-            handle_deny_write(notify_fd, req, whitelist, syscall_name(nr));
+            handle_deny_write(notify_fd, req, cow, whitelist, syscall_name(nr));
         }
         n if n == libc::SYS_fchownat
             || n == libc::SYS_chown as i64
             || n == libc::SYS_lchown as i64 =>
         {
-            handle_deny_write(notify_fd, req, whitelist, syscall_name(nr));
+            handle_deny_write(notify_fd, req, cow, whitelist, syscall_name(nr));
         }
 
         _ => { let _ = notif::respond_continue(notify_fd, req.id); }
@@ -191,11 +191,21 @@ fn handle_openat(notify_fd: RawFd, req: &SeccompNotif, cow: &mut CowTable, white
         return;
     }
 
-    if let Some(cp) = cow.lookup(&path_str) {
-        eprintln!("[supervisor] COW-HIT openat({}, {}) -> {} pid={}", path_str, mode_str, cp.display(), req.pid);
-        match cow.inject_fd(notify_fd, req.id, cp, open_flags, mode) {
-            Ok(_) => return,
-            Err(e) => { eprintln!("[supervisor] COW inject failed: {}", e); let _ = notif::respond_errno(notify_fd, req.id, libc::EACCES); return; }
+    if cow.lookup(&path_str).is_some() {
+        // If this is a write open, snapshot for per-command tracking before injecting fd
+        if accmode != libc::O_RDONLY {
+            let cmd = cow::read_command_context(req.pid);
+            if let Err(e) = cow.snapshot_for_reopen(&path_str, "openat", &cmd) {
+                eprintln!("[supervisor] COW snapshot failed: {}", e);
+            }
+        }
+        // Re-lookup (cow_path may have changed after snapshot)
+        if let Some(cp) = cow.lookup(&path_str) {
+            eprintln!("[supervisor] COW-HIT openat({}, {}) -> {} pid={}", path_str, mode_str, cp.display(), req.pid);
+            match cow.inject_fd(notify_fd, req.id, cp, open_flags, mode) {
+                Ok(_) => return,
+                Err(e) => { eprintln!("[supervisor] COW inject failed: {}", e); let _ = notif::respond_errno(notify_fd, req.id, libc::EACCES); return; }
+            }
         }
     }
 
@@ -404,7 +414,7 @@ fn handle_truncate(notify_fd: RawFd, req: &SeccompNotif, cow: &mut CowTable, whi
 // DENY-only handlers
 // ================================================================
 
-fn handle_deny_write(notify_fd: RawFd, req: &SeccompNotif, whitelist: &Whitelist, name: &str) {
+fn handle_deny_write(notify_fd: RawFd, req: &SeccompNotif, cow: &mut CowTable, whitelist: &Whitelist, name: &str) {
     let nr = req.data.nr as i64;
 
     if nr == libc::SYS_linkat || nr == libc::SYS_link as i64 {
@@ -431,6 +441,26 @@ fn handle_deny_write(notify_fd: RawFd, req: &SeccompNotif, whitelist: &Whitelist
         eprintln!("[supervisor] ALLOW {}({}) pid={}", name, path_str, req.pid);
         let _ = notif::respond_continue(notify_fd, req.id);
         return;
+    }
+
+    // Allow unlink/rmdir for cow-created files (not on the real filesystem)
+    let is_unlink = nr == libc::SYS_unlinkat || nr == libc::SYS_unlink as i64;
+    let is_rmdir = nr == libc::SYS_rmdir as i64;
+    if (is_unlink || is_rmdir) && cow.is_cow_created(&path_str) {
+        let cmd = cow::read_command_context(req.pid);
+        let result = if is_unlink {
+            cow.cow_unlink(&path_str, name, &cmd)
+        } else {
+            cow.cow_rmdir(&path_str, name, &cmd)
+        };
+        match result {
+            Ok(()) => {
+                eprintln!("[supervisor] COW   {}({}) pid={} — cow-created removed", name, path_str, req.pid);
+                let _ = notif::respond_value(notify_fd, req.id, 0);
+                return;
+            }
+            Err(e) => eprintln!("[supervisor] COW {} failed: {}", name, e),
+        }
     }
 
     let reason = match nr {
