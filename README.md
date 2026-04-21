@@ -8,7 +8,7 @@
 - **Post-review Reality.** Review changes, approve only what you want — approved changes become real *instantly*, no re-execution needed.
 - **Chaos Simplification.** The DAG simplifier collapses redundant operations and surfaces only the changes that actually matter — less noise, faster approval.
 
-Two ways to use with [opencode](https://github.com/xbjpku/opencode): the [sandbox-integration fork](https://github.com/xbjpku/opencode/tree/sandbox-integration) with built-in support, or the [non-invasive plugin](https://github.com/xbjpku/ScarletWitch-Opencode) that requires only a [+9 line hook](https://github.com/xbjpku/opencode/tree/plugin-hooks) to upstream. ScarletWitch is also a standalone binary — anything that runs under it can be hexed.
+Two ways to use with [opencode](https://github.com/xbjpku/opencode): the [sandbox-integration fork](https://github.com/xbjpku/opencode/tree/sandbox-integration) with built-in support, or the [non-invasive plugin](https://github.com/xbjpku/ScarletWitch-Opencode) that requires only a [+9 line hook](https://github.com/anomalyco/opencode/pull/23650) to upstream. ScarletWitch is also a standalone binary — anything that runs under it can be hexed.
 
 ## How it works
 
@@ -79,7 +79,7 @@ Add to `.opencode/opencode.json`:
 
 opencode will automatically start the supervisor, sandbox bash commands, and show a COW commit dialog after each turn for you to review and approve file changes.
 
-Alternatively, use the [**ScarletWitch-Opencode plugin**](https://github.com/xbjpku/ScarletWitch-Opencode) for a non-invasive integration — no fork needed, just a [+9 line hook](https://github.com/xbjpku/opencode/tree/plugin-hooks) to opencode upstream. Plugin-based integration for Claude Code and OpenClaw is under development.
+Alternatively, use the [**ScarletWitch-Opencode plugin**](https://github.com/xbjpku/ScarletWitch-Opencode) for a non-invasive integration — no fork needed, just a [+9 line hook](https://github.com/anomalyco/opencode/pull/23650) to opencode upstream. Plugin-based integration for Claude Code and OpenClaw is under development.
 
 ### Standalone
 
