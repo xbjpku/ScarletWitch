@@ -8,8 +8,6 @@
 - **Post-review Reality.** Review changes, approve only what you want — approved changes become real *instantly*, no re-execution needed.
 - **Chaos Simplification.** The DAG simplifier collapses redundant operations and surfaces only the changes that actually matter — less noise, faster approval.
 
-Two ways to use with [opencode](https://github.com/xbjpku/opencode): the [integration fork](https://github.com/xbjpku/opencode/tree/integration) with built-in support, or the [non-invasive plugin](https://github.com/xbjpku/ScarletWitch-opencode-plugin) that requires only a [+9 line hook](https://github.com/anomalyco/opencode/pull/23650) to upstream. ScarletWitch is also a standalone binary — anything that runs under it can be hexed.
-
 ## How it works
 
 ```
@@ -26,7 +24,7 @@ Two ways to use with [opencode](https://github.com/xbjpku/opencode): the [integr
 │  Supervisor (Rust, async tokio)                     │
 │    ├─ intercepts: openat, mkdir, rename, symlink,   │
 │    │   chmod, truncate, unlink (cow-created only)   │
-│    ├─ COW layer: writes go to /tmp/scarletwitch/ses_*/  │
+│    ├─ COW layer: writes go to /tmp/scarletwitch/    │
 │    ├─ per-command versioning (BEGIN_COMMAND protocol)│
 │    ├─ DAG simplification (strict/medium/loose)      │
 │    └─ control socket: LIST_COW, COMMIT, DISCARD     │
@@ -35,10 +33,14 @@ Two ways to use with [opencode](https://github.com/xbjpku/opencode): the [integr
 
 **Key features:**
 
-- **Zero-copy interception** — seccomp user notifications + fd injection, no ptrace overhead
-- **Per-command snapshots** — each bash tool call gets its own generation; reopening a file in a new command creates a versioned copy (`.v0`, `.v1`, ...)
-- **Three review levels** — `strict` (show all actions that affect the filesys, for the most thorough review), `medium` (skip intermediate steps that don't affect the final filesystem state), `loose` (only the final diff of each changed file)
+- **Syscall-level sandboxing** — Intercepts dangerous filesystem syscalls (write, mkdir, rename, chmod, truncate) via seccomp user notifications. Destructive operations like `rm` on real files are denied. Read access is controlled by a simple whitelist to prevent disk scanning or secret leakage. Zero ptrace overhead.
+- **Post-review only** — No mid-execution permission prompts. The agent runs at full speed while snapshots are recorded per command in the COW layer. You review everything *after* the turn completes — faster than interrupting every step.
+- **Three review levels** — `strict` (show all actions that affect the filesystem, for the most thorough review), `medium` (skip intermediate steps that don't affect the final filesystem state), `loose` (only the final diff of each changed file)
 - **Selective commit** — commit the first N commands as a prefix, or commit/discard all
+
+## Quick Start
+
+Use the [**ScarletWitch-opencode-plugin**](https://github.com/xbjpku/ScarletWitch-opencode-plugin) for the easiest setup — self-contained, no fork needed. Plugins for Claude Code and OpenClaw are under development.
 
 ## Prerequisites
 
@@ -59,11 +61,11 @@ Produces three binaries in `build/`:
 - `sandbox_preload.so` — LD_PRELOAD library for child processes
 - `reload` — utility to hot-reload whitelist config
 
-## Usage
+## More Usage
 
-### With opencode
+### With opencode (fork)
 
-Add to `.opencode/opencode.json`:
+Use the [integration fork](https://github.com/xbjpku/opencode/tree/integration) with built-in support. Add to `.opencode/opencode.json`:
 
 ```json
 {
@@ -76,10 +78,6 @@ Add to `.opencode/opencode.json`:
   }
 }
 ```
-
-opencode will automatically start the supervisor, sandbox bash commands, and show a COW commit dialog after each turn for you to review and approve file changes.
-
-Alternatively, use the [**ScarletWitch-opencode-plugin**](https://github.com/xbjpku/ScarletWitch-opencode-plugin) for a non-invasive integration — no fork needed, just a [+9 line hook](https://github.com/anomalyco/opencode/pull/23650) to opencode upstream. Plugin-based integration for Claude Code is under development.
 
 ### Standalone
 
@@ -119,19 +117,6 @@ echo "DISCARD" | nc -U /tmp/scarletwitch/my_session.ctrl.sock
 /secret/data/
 ```
 
-## Control protocol
-
-The supervisor listens on a Unix socket (`{dir}/{session}.ctrl.sock`) for line-based commands:
-
-| Command | Description |
-|---------|-------------|
-| `BEGIN_COMMAND` | Increment generation counter (new bash command starting) |
-| `LIST_COW [strict\|medium\|loose]` | List pending COW entries as JSON (default: `medium`) |
-| `COMMIT ["/path1","/path2"]` | Commit selected files (copy COW → real path) |
-| `COMMIT_GEN <N>` | Commit all entries with generation ≤ N |
-| `DISCARD` | Discard all COW state |
-| `RELOAD` | Hot-reload whitelist config from disk |
-
 ## Tests
 
 ```bash
@@ -154,8 +139,6 @@ ScarletWitch/
 ├── src/
 │   ├── sandbox_preload.c  # LD_PRELOAD: seccomp + Landlock + notify fd
 │   └── reload.c           # whitelist hot-reload utility
-├── 3rdparty/
-│   └── opencode.md        # opencode fork reference
 ├── whitelist.conf          # default permission config
 ├── test.sh                 # integration tests
 └── Makefile
