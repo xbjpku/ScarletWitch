@@ -30,8 +30,9 @@ pub struct CowEntry {
     pub cow_path: PathBuf,
     pub operation: String,  // "openat", "mkdir(legacy)", "fchmodat", etc.
     pub command: String,    // from /proc/{pid}/cmdline
+    pub cmd_id: String,     // from SCARLET_CMD_ID env var (unique per tool call)
     pub timestamp: u64,     // unix epoch seconds
-    pub generation: u64,    // command generation (set by BEGIN_COMMAND)
+    pub generation: u64,    // kept for backward compat / ordering
 }
 
 pub struct CowTable {
@@ -40,7 +41,7 @@ pub struct CowTable {
     cow_dir: PathBuf,
     manifest_path: PathBuf,
     deleted_path: PathBuf,
-    generation: u64,  // incremented by BEGIN_COMMAND
+    generation: u64,
 }
 
 /// Read /proc/{pid}/cmdline, replace NUL bytes with spaces.
@@ -52,6 +53,21 @@ pub fn read_command_context(pid: u32) -> String {
                 .map(|s| String::from_utf8_lossy(s).to_string())
                 .collect::<Vec<_>>()
                 .join(" ")
+        })
+        .unwrap_or_default()
+}
+
+/// Read SCARLET_CMD_ID from /proc/{pid}/environ.
+pub fn read_cmd_id(pid: u32) -> String {
+    fs::read(format!("/proc/{}/environ", pid))
+        .map(|b| {
+            b.split(|&c| c == 0)
+                .filter_map(|s| {
+                    let s = String::from_utf8_lossy(s);
+                    s.strip_prefix("SCARLET_CMD_ID=").map(|v| v.to_string())
+                })
+                .next()
+                .unwrap_or_default()
         })
         .unwrap_or_default()
 }
@@ -123,6 +139,7 @@ impl CowTable {
         orig_path: &str,
         operation: &str,
         command: &str,
+        cmd_id: &str,
     ) -> io::Result<()> {
         // Find the latest entry for this file
         let latest_idx = self.entries.iter().rposition(|e| e.orig_path == orig_path);
@@ -131,8 +148,8 @@ impl CowTable {
             None => return Ok(()),
         };
 
-        // Only snapshot if the generation has advanced (new command)
-        if self.entries[latest_idx].generation == self.generation {
+        // Only snapshot if this is a different command (different cmd_id)
+        if self.entries[latest_idx].cmd_id == cmd_id {
             return Ok(());
         }
 
@@ -154,13 +171,14 @@ impl CowTable {
         // Update old entry to point at the versioned path
         self.entries[latest_idx].cow_path = versioned;
 
-        // Push a new entry for the current generation
+        self.resolve_generation(cmd_id);
         self.entries.push(CowEntry {
             orig_path: orig_path.to_string(),
             cow_path: cur_cow_path,
             operation: operation.to_string(),
             command: command.to_string(),
             timestamp: now_epoch(),
+            cmd_id: cmd_id.to_string(),
             generation: self.generation,
         });
 
@@ -178,12 +196,20 @@ impl CowTable {
         &self.entries
     }
 
-    /// Advance the generation counter.  Called by the BEGIN_COMMAND control
-    /// command so that subsequent writes to already-COW'd files create a
-    /// versioned snapshot instead of silently mutating the existing copy.
-    pub fn begin_command(&mut self) {
+    /// Resolve the generation for a cmd_id.
+    /// Same cmd_id always gets the same generation (handles parallel interleaving).
+    /// New cmd_id gets a new (incremented) generation.
+    fn resolve_generation(&mut self, cmd_id: &str) {
+        if cmd_id.is_empty() { return; }
+        // Reuse generation if we've seen this cmd_id before
+        for e in self.entries.iter().rev() {
+            if e.cmd_id == cmd_id {
+                self.generation = e.generation;
+                return;
+            }
+        }
+        // New cmd_id — increment
         self.generation += 1;
-        eprintln!("[cow] begin_command: generation={}", self.generation);
     }
 
     pub fn deleted_paths(&self) -> &HashSet<String> {
@@ -205,6 +231,7 @@ impl CowTable {
         mode: u32,
         operation: &str,
         command: &str,
+        cmd_id: &str,
     ) -> io::Result<()> {
         if self.lookup(orig_path).is_some() {
             return Ok(());
@@ -250,12 +277,14 @@ impl CowTable {
         }
 
         self.deleted.remove(orig_path);
+        self.resolve_generation(cmd_id);
         self.entries.push(CowEntry {
             orig_path: orig_path.to_string(),
             cow_path,
             operation: operation.to_string(),
             command: command.to_string(),
             timestamp: now_epoch(),
+            cmd_id: cmd_id.to_string(),
             generation: self.generation,
         });
 
@@ -265,13 +294,13 @@ impl CowTable {
         Ok(())
     }
 
-    fn ensure_materialized(&mut self, orig_path: &str, operation: &str, command: &str) -> io::Result<PathBuf> {
+    fn ensure_materialized(&mut self, orig_path: &str, operation: &str, command: &str, cmd_id: &str) -> io::Result<PathBuf> {
         if self.lookup(orig_path).is_some() {
             // Already in cow — create versioned snapshot if generation advanced
-            self.snapshot_for_reopen(orig_path, operation, command)?;
+            self.snapshot_for_reopen(orig_path, operation, command, cmd_id)?;
             return Ok(self.lookup(orig_path).unwrap().to_path_buf());
         }
-        self.materialize(orig_path, libc::O_WRONLY, 0o644, operation, command)?;
+        self.materialize(orig_path, libc::O_WRONLY, 0o644, operation, command, cmd_id)?;
         self.lookup(orig_path)
             .map(|p| p.to_path_buf())
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "materialize failed"))
@@ -303,7 +332,7 @@ impl CowTable {
     // Write-family COW operations
     // ================================================================
 
-    pub fn cow_mkdir(&mut self, orig_path: &str, mode: u32, operation: &str, command: &str) -> io::Result<()> {
+    pub fn cow_mkdir(&mut self, orig_path: &str, mode: u32, operation: &str, command: &str, cmd_id: &str) -> io::Result<()> {
         let cow_path = self.cow_path_for(orig_path);
         fs::create_dir_all(&cow_path)?;
         use std::os::unix::fs::PermissionsExt;
@@ -316,6 +345,7 @@ impl CowTable {
             operation: operation.to_string(),
             command: command.to_string(),
             timestamp: now_epoch(),
+            cmd_id: cmd_id.to_string(),
             generation: self.generation,
         });
         if let Err(e) = self.save_manifest() { eprintln!("[cow] save manifest: {}", e); }
@@ -323,7 +353,7 @@ impl CowTable {
         Ok(())
     }
 
-    pub fn cow_rename(&mut self, src_path: &str, dst_path: &str, operation: &str, command: &str) -> io::Result<()> {
+    pub fn cow_rename(&mut self, src_path: &str, dst_path: &str, operation: &str, command: &str, cmd_id: &str) -> io::Result<()> {
         let src_cow = if let Some(p) = self.lookup(src_path) {
             p.to_path_buf()
         } else {
@@ -334,7 +364,7 @@ impl CowTable {
                     format!("rename source {} does not exist", src_path),
                 ));
             }
-            self.materialize(src_path, libc::O_RDONLY, 0o644, operation, command)?;
+            self.materialize(src_path, libc::O_RDONLY, 0o644, operation, command, cmd_id)?;
             self.lookup(src_path)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "materialize failed"))?
                 .to_path_buf()
@@ -353,6 +383,7 @@ impl CowTable {
             operation: operation.to_string(),
             command: command.to_string(),
             timestamp: now_epoch(),
+            cmd_id: cmd_id.to_string(),
             generation: self.generation,
         });
         self.deleted.remove(dst_path);
@@ -362,7 +393,7 @@ impl CowTable {
         Ok(())
     }
 
-    pub fn cow_symlink(&mut self, target: &str, linkpath: &str, operation: &str, command: &str) -> io::Result<()> {
+    pub fn cow_symlink(&mut self, target: &str, linkpath: &str, operation: &str, command: &str, cmd_id: &str) -> io::Result<()> {
         let cow_link = self.cow_path_for(linkpath);
         if let Some(parent) = cow_link.parent() {
             fs::create_dir_all(parent)?;
@@ -375,6 +406,7 @@ impl CowTable {
             operation: operation.to_string(),
             command: command.to_string(),
             timestamp: now_epoch(),
+            cmd_id: cmd_id.to_string(),
             generation: self.generation,
         });
         if let Err(e) = self.save_manifest() { eprintln!("[cow] save manifest: {}", e); }
@@ -382,16 +414,16 @@ impl CowTable {
         Ok(())
     }
 
-    pub fn cow_chmod(&mut self, orig_path: &str, mode: u32, operation: &str, command: &str) -> io::Result<()> {
-        let cow_path = self.ensure_materialized(orig_path, operation, command)?;
+    pub fn cow_chmod(&mut self, orig_path: &str, mode: u32, operation: &str, command: &str, cmd_id: &str) -> io::Result<()> {
+        let cow_path = self.ensure_materialized(orig_path, operation, command, cmd_id)?;
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&cow_path, fs::Permissions::from_mode(mode))?;
         eprintln!("[cow] chmod {} mode={:o}", orig_path, mode);
         Ok(())
     }
 
-    pub fn cow_truncate(&mut self, orig_path: &str, length: i64, operation: &str, command: &str) -> io::Result<()> {
-        let cow_path = self.ensure_materialized(orig_path, operation, command)?;
+    pub fn cow_truncate(&mut self, orig_path: &str, length: i64, operation: &str, command: &str, cmd_id: &str) -> io::Result<()> {
+        let cow_path = self.ensure_materialized(orig_path, operation, command, cmd_id)?;
         let file = fs::OpenOptions::new().write(true).open(&cow_path)?;
         file.set_len(length as u64)?;
         eprintln!("[cow] truncate {} len={}", orig_path, length);
@@ -408,7 +440,7 @@ impl CowTable {
         self.lookup(orig_path).is_some() && !Path::new(orig_path).exists()
     }
 
-    pub fn cow_unlink(&mut self, orig_path: &str, _operation: &str, _command: &str) -> io::Result<()> {
+    pub fn cow_unlink(&mut self, orig_path: &str, _operation: &str, _command: &str, _cmd_id: &str) -> io::Result<()> {
         // Remove the cow file
         if let Some(cp) = self.lookup(orig_path) {
             let cp = cp.to_path_buf();
@@ -424,7 +456,7 @@ impl CowTable {
         Ok(())
     }
 
-    pub fn cow_rmdir(&mut self, orig_path: &str, _operation: &str, _command: &str) -> io::Result<()> {
+    pub fn cow_rmdir(&mut self, orig_path: &str, _operation: &str, _command: &str, _cmd_id: &str) -> io::Result<()> {
         let cow_path = self.cow_path_for(orig_path);
         if cow_path.exists() && cow_path.is_dir() {
             let _ = fs::remove_dir_all(&cow_path);
@@ -684,11 +716,12 @@ impl CowTable {
             .iter()
             .map(|e| {
                 format!(
-                    r#"{{"orig_path":"{}","cow_path":"{}","operation":"{}","command":"{}","timestamp":{},"generation":{}}}"#,
+                    r#"{{"orig_path":"{}","cow_path":"{}","operation":"{}","command":"{}","cmd_id":"{}","timestamp":{},"generation":{}}}"#,
                     json_escape(&e.orig_path),
                     json_escape(&e.cow_path.to_string_lossy()),
                     json_escape(&e.operation),
                     json_escape(&e.command),
+                    json_escape(&e.cmd_id),
                     e.timestamp,
                     e.generation
                 )
@@ -824,7 +857,8 @@ impl CowTable {
                     orig_path: orig,
                     cow_path,
                     operation,
-                    command: String::new(), // not persisted in manifest
+                    command: String::new(),
+                    cmd_id: String::new(),
                     timestamp,
                     generation: 0,
                 });

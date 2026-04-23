@@ -44,17 +44,14 @@ start_supervisor() {
     fi
 }
 
-# Run a command under the sandbox, sending BEGIN_COMMAND first
+# Run a command under the sandbox with a unique SCARLET_CMD_ID
+CMD_COUNTER=0
 run_cmd() {
-    # Send BEGIN_COMMAND via control socket
-    node -e "
-var c=require('net').createConnection('$BASE/$SESSION.ctrl.sock',function(){c.write('BEGIN_COMMAND\n')});
-var d='';c.on('data',function(k){d+=k});c.on('end',function(){process.exit(0)});
-c.on('error',function(){process.exit(1)});setTimeout(function(){process.exit(0)},500);
-    " 2>/dev/null
+    CMD_COUNTER=$((CMD_COUNTER + 1))
 
     SANDBOX_SOCK_PATH="$BASE/$SESSION.notify.sock" \
     LD_PRELOAD="$DIR/build/sandbox_preload.so" \
+    SCARLET_CMD_ID="test_cmd_$CMD_COUNTER" \
         bash -c "$1" 2>/dev/null
 }
 
@@ -762,6 +759,96 @@ L=$(list_cow loose  | node -e "process.stdin.on('data',d=>{console.log(JSON.pars
 assert_eq "strict: 1 (consecutive identical collapsed even in strict)" "1" "$S"
 assert_eq "medium: 1" "1" "$M"
 assert_eq "loose: 1" "1" "$L"
+
+cleanup
+
+########################################################################
+echo -e "\n${CYAN}=== Test 29: Parallel commands — different files ===${NC}"
+echo "  Two commands run concurrently writing different files, each gets own cmd_id"
+########################################################################
+echo "original_a" > "$WORKSPACE/test_cow.txt"
+echo "original_b" > "$WORKSPACE/test_cow2.txt"
+start_supervisor
+
+# Run two commands in parallel with different SCARLET_CMD_IDs
+SANDBOX_SOCK_PATH="$BASE/$SESSION.notify.sock" \
+LD_PRELOAD="$DIR/build/sandbox_preload.so" \
+SCARLET_CMD_ID="parallel_A" \
+    bash -c "echo parallel_a > $WORKSPACE/test_cow.txt" 2>/dev/null &
+PID1=$!
+
+SANDBOX_SOCK_PATH="$BASE/$SESSION.notify.sock" \
+LD_PRELOAD="$DIR/build/sandbox_preload.so" \
+SCARLET_CMD_ID="parallel_B" \
+    bash -c "echo parallel_b > $WORKSPACE/test_cow2.txt" 2>/dev/null &
+PID2=$!
+
+wait $PID1 $PID2
+
+COW_JSON=$(list_cow strict)
+COUNT=$(echo "$COW_JSON" | node -e "process.stdin.on('data',d=>{console.log(JSON.parse(d).count)})")
+assert_eq "2 entries from parallel cmds" "2" "$COUNT"
+
+# Each entry should have a different cmd_id
+CMD_IDS=$(echo "$COW_JSON" | node -e "process.stdin.on('data',d=>{const e=JSON.parse(d).entries;console.log([...new Set(e.map(x=>x.cmd_id))].sort().join(','))})")
+assert_eq "2 distinct cmd_ids" "parallel_A,parallel_B" "$CMD_IDS"
+
+# Both should have the same generation? No — different cmd_ids get different generations
+GENS=$(echo "$COW_JSON" | node -e "process.stdin.on('data',d=>{const e=JSON.parse(d).entries;console.log([...new Set(e.map(x=>x.generation))].length)})")
+assert_eq "2 distinct generations" "2" "$GENS"
+
+# COMMIT_GEN with the lower generation should commit only one file
+LOWER_GEN=$(echo "$COW_JSON" | node -e "process.stdin.on('data',d=>{const e=JSON.parse(d).entries;console.log(Math.min(...e.map(x=>x.generation)))})")
+commit_gen "$LOWER_GEN"
+
+# One file should be committed, one still in cow
+REMAINING=$(list_cow strict | node -e "process.stdin.on('data',d=>{console.log(JSON.parse(d).count)})")
+assert_eq "1 entry remaining after partial commit" "1" "$REMAINING"
+
+cleanup
+
+########################################################################
+echo -e "\n${CYAN}=== Test 30: Parallel commands — same file ===${NC}"
+echo "  Two commands write to the same file concurrently, each gets own version"
+########################################################################
+echo "original" > "$WORKSPACE/test_cow.txt"
+start_supervisor
+
+# First command writes
+SANDBOX_SOCK_PATH="$BASE/$SESSION.notify.sock" \
+LD_PRELOAD="$DIR/build/sandbox_preload.so" \
+SCARLET_CMD_ID="same_file_A" \
+    bash -c "echo version_A > $WORKSPACE/test_cow.txt" 2>/dev/null
+
+# Second command writes to same file (different cmd_id = snapshot)
+SANDBOX_SOCK_PATH="$BASE/$SESSION.notify.sock" \
+LD_PRELOAD="$DIR/build/sandbox_preload.so" \
+SCARLET_CMD_ID="same_file_B" \
+    bash -c "echo version_B > $WORKSPACE/test_cow.txt" 2>/dev/null
+
+COW_JSON=$(list_cow strict)
+COUNT=$(echo "$COW_JSON" | node -e "process.stdin.on('data',d=>{console.log(JSON.parse(d).count)})")
+assert_eq "2 entries for same file, different cmd_ids" "2" "$COUNT"
+
+# Entries should have different cmd_ids
+CMD_IDS=$(echo "$COW_JSON" | node -e "process.stdin.on('data',d=>{const e=JSON.parse(d).entries;console.log([...new Set(e.map(x=>x.cmd_id))].sort().join(','))})")
+assert_eq "cmd_ids are same_file_A and same_file_B" "same_file_A,same_file_B" "$CMD_IDS"
+
+# Same cmd_id entries should share the same generation
+GEN_A=$(echo "$COW_JSON" | node -e "process.stdin.on('data',d=>{const e=JSON.parse(d).entries.find(x=>x.cmd_id==='same_file_A');console.log(e.generation)})")
+GEN_B=$(echo "$COW_JSON" | node -e "process.stdin.on('data',d=>{const e=JSON.parse(d).entries.find(x=>x.cmd_id==='same_file_B');console.log(e.generation)})")
+assert_eq "different generations for different cmd_ids" "true" "$([ "$GEN_A" != "$GEN_B" ] && echo true || echo false)"
+
+# v0 should have version_A, latest should have version_B
+V0=$(cat "$BASE/$SESSION/cow_files$WORKSPACE/test_cow.v0")
+LATEST=$(cat "$BASE/$SESSION/cow_files$WORKSPACE/test_cow.txt")
+assert_eq "v0 = version_A" "version_A" "$V0"
+assert_eq "latest = version_B" "version_B" "$LATEST"
+
+# Commit only first generation (version_A)
+commit_gen "$GEN_A"
+DISK=$(cat "$WORKSPACE/test_cow.txt")
+assert_eq "disk has version_A after partial commit" "version_A" "$DISK"
 
 cleanup
 

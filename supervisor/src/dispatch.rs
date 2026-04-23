@@ -12,6 +12,11 @@ use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 
 use crate::cow::{self, CowTable};
+
+/// Read both command context and cmd_id for a process.
+fn read_context(pid: u32) -> (String, String) {
+    (cow::read_command_context(pid), cow::read_cmd_id(pid))
+}
 use crate::notif::{self, SeccompNotif};
 use crate::path;
 use crate::whitelist::Whitelist;
@@ -180,8 +185,8 @@ fn handle_openat(notify_fd: RawFd, req: &SeccompNotif, cow: &mut CowTable, white
 
     if cow.is_deleted(&path_str) {
         if open_flags & libc::O_CREAT != 0 && accmode != libc::O_RDONLY {
-            let cmd = cow::read_command_context(req.pid);
-            if cow.materialize(&path_str, open_flags, mode as u32, "openat", &cmd).is_ok() {
+            let (cmd, cmd_id) = read_context(req.pid);
+            if cow.materialize(&path_str, open_flags, mode as u32, "openat", &cmd, &cmd_id).is_ok() {
                 if let Some(cp) = cow.lookup(&path_str) {
                     if cow.inject_fd(notify_fd, req.id, cp, open_flags, mode).is_ok() { return; }
                 }
@@ -194,8 +199,8 @@ fn handle_openat(notify_fd: RawFd, req: &SeccompNotif, cow: &mut CowTable, white
     if cow.lookup(&path_str).is_some() {
         // If this is a write open, snapshot for per-command tracking before injecting fd
         if accmode != libc::O_RDONLY {
-            let cmd = cow::read_command_context(req.pid);
-            if let Err(e) = cow.snapshot_for_reopen(&path_str, "openat", &cmd) {
+            let (cmd, cmd_id) = read_context(req.pid);
+            if let Err(e) = cow.snapshot_for_reopen(&path_str, "openat", &cmd, &cmd_id) {
                 eprintln!("[supervisor] COW snapshot failed: {}", e);
             }
         }
@@ -216,9 +221,9 @@ fn handle_openat(notify_fd: RawFd, req: &SeccompNotif, cow: &mut CowTable, white
     }
 
     if accmode != libc::O_RDONLY {
-        let cmd = cow::read_command_context(req.pid);
+        let (cmd, cmd_id) = read_context(req.pid);
         eprintln!("[supervisor] COW-NEW openat({}, {}) pid={}", path_str, mode_str, req.pid);
-        if cow.materialize(&path_str, open_flags, mode as u32, "openat", &cmd).is_ok() {
+        if cow.materialize(&path_str, open_flags, mode as u32, "openat", &cmd, &cmd_id).is_ok() {
             if let Some(cp) = cow.lookup(&path_str) {
                 if cow.inject_fd(notify_fd, req.id, cp, open_flags, mode).is_ok() { return; }
             }
@@ -249,9 +254,9 @@ fn handle_mkdir(notify_fd: RawFd, req: &SeccompNotif, cow: &mut CowTable, whitel
     }
 
     let mode = if nr == libc::SYS_mkdir as i64 { req.data.args[1] as u32 } else { req.data.args[2] as u32 };
-    let cmd = cow::read_command_context(req.pid);
+    let (cmd, cmd_id) = read_context(req.pid);
 
-    match cow.cow_mkdir(&path_str, mode, name, &cmd) {
+    match cow.cow_mkdir(&path_str, mode, name, &cmd, &cmd_id) {
         Ok(()) => {
             eprintln!("[supervisor] COW   {}({}, {:o}) pid={}", name, path_str, mode, req.pid);
             let _ = notif::respond_value(notify_fd, req.id, 0);
@@ -281,8 +286,8 @@ fn handle_rename(notify_fd: RawFd, req: &SeccompNotif, cow: &mut CowTable, white
         return;
     }
 
-    let cmd = cow::read_command_context(req.pid);
-    match cow.cow_rename(&src, &dst, name, &cmd) {
+    let (cmd, cmd_id) = read_context(req.pid);
+    match cow.cow_rename(&src, &dst, name, &cmd, &cmd_id) {
         Ok(()) => {
             eprintln!("[supervisor] COW   {}({} -> {}) pid={}", name, src, dst, req.pid);
             let _ = notif::respond_value(notify_fd, req.id, 0);
@@ -332,8 +337,8 @@ fn handle_symlink(notify_fd: RawFd, req: &SeccompNotif, cow: &mut CowTable, whit
         return;
     }
 
-    let cmd = cow::read_command_context(req.pid);
-    match cow.cow_symlink(&target, &link_str, name, &cmd) {
+    let (cmd, cmd_id) = read_context(req.pid);
+    match cow.cow_symlink(&target, &link_str, name, &cmd, &cmd_id) {
         Ok(()) => {
             eprintln!("[supervisor] COW   {}({} -> {}) pid={}", name, link_str, target, req.pid);
             let _ = notif::respond_value(notify_fd, req.id, 0);
@@ -365,9 +370,9 @@ fn handle_chmod(notify_fd: RawFd, req: &SeccompNotif, cow: &mut CowTable, whitel
     }
 
     let mode = if nr == libc::SYS_chmod as i64 { req.data.args[1] as u32 } else { req.data.args[2] as u32 };
-    let cmd = cow::read_command_context(req.pid);
+    let (cmd, cmd_id) = read_context(req.pid);
 
-    match cow.cow_chmod(&path_str, mode, name, &cmd) {
+    match cow.cow_chmod(&path_str, mode, name, &cmd, &cmd_id) {
         Ok(()) => {
             eprintln!("[supervisor] COW   {}({}, {:o}) pid={}", name, path_str, mode, req.pid);
             let _ = notif::respond_value(notify_fd, req.id, 0);
@@ -396,9 +401,9 @@ fn handle_truncate(notify_fd: RawFd, req: &SeccompNotif, cow: &mut CowTable, whi
     }
 
     let length = req.data.args[1] as i64;
-    let cmd = cow::read_command_context(req.pid);
+    let (cmd, cmd_id) = read_context(req.pid);
 
-    match cow.cow_truncate(&path_str, length, "truncate", &cmd) {
+    match cow.cow_truncate(&path_str, length, "truncate", &cmd, &cmd_id) {
         Ok(()) => {
             eprintln!("[supervisor] COW   truncate({}, {}) pid={}", path_str, length, req.pid);
             let _ = notif::respond_value(notify_fd, req.id, 0);
@@ -447,11 +452,11 @@ fn handle_deny_write(notify_fd: RawFd, req: &SeccompNotif, cow: &mut CowTable, w
     let is_unlink = nr == libc::SYS_unlinkat || nr == libc::SYS_unlink as i64;
     let is_rmdir = nr == libc::SYS_rmdir as i64;
     if (is_unlink || is_rmdir) && cow.is_cow_created(&path_str) {
-        let cmd = cow::read_command_context(req.pid);
+        let (cmd, cmd_id) = read_context(req.pid);
         let result = if is_unlink {
-            cow.cow_unlink(&path_str, name, &cmd)
+            cow.cow_unlink(&path_str, name, &cmd, &cmd_id)
         } else {
-            cow.cow_rmdir(&path_str, name, &cmd)
+            cow.cow_rmdir(&path_str, name, &cmd, &cmd_id)
         };
         match result {
             Ok(()) => {

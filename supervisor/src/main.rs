@@ -405,9 +405,6 @@ async fn main() {
                                     ).await;
                                 }
                             }
-                        } else if cmd == "BEGIN_COMMAND" {
-                            cow_table.begin_command();
-                            let _ = stream.write_all(b"{\"ok\":true}\n").await;
                         } else if cmd.starts_with("LIST_COW") {
                             // LIST_COW [strict|medium|loose]  (default: medium)
                             let level = cmd.strip_prefix("LIST_COW").unwrap_or("").trim();
